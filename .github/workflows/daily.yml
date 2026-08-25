@@ -24,16 +24,16 @@ jobs:
       - name: Pull the last few days of results
         env:
           BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}
-        run: python scripts/update_data.py
+        run: python mlb-projector/scripts/update_data.py
 
       - name: Rebuild the page
-        run: python scripts/build_page.py
+        run: python mlb-projector/scripts/build_page.py
 
       - name: Commit if anything changed
         run: |
           git config user.name "projector-bot"
           git config user.email "actions@github.com"
-          git add data.db index.html
+          git add mlb-projector/data.db mlb-projector/index.html
           if git diff --staged --quiet; then
             echo "no change today"
           else
