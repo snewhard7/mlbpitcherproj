@@ -67,8 +67,27 @@ PROP_LINES = {
 # Any feature that must be extrapolated to be used is a liability. If a
 # seasonal effect is wanted later, encode it as a bounded categorical, and
 # make it beat this on held-out data before it goes in.
-SHARED = ["rest", "n_starts", "pen_outs_1d", "pen_outs_3d", "home",
-          "opp_runs"]
+# BULLPEN STATE IS DELIBERATELY ABSENT, and so is `month`.
+#
+# The bullpen idea was that a pen worn down over the previous few days
+# buys the starter a longer leash. It was the strongest prior going in and
+# it is dead, tested three ways:
+#
+#     vs the market residual, 136 starts      -1.41 sigma
+#     vs outs, full population, 3,855 starts  +0.85 sigma
+#     all variants (1d outs, 3d outs, 3d pitches)  under 0.9 sigma
+#
+# At 3,855 starts a real effect would be unmissable. Swinging the feature
+# across its entire realistic range -- a rested pen at 13 outs to a
+# hammered one at 46 -- moved projections by 0.15 outs against per-start
+# noise of 3.6, roughly 4% of the uncertainty from the most extreme input
+# possible. It was also the only field on the phone page that required
+# looking something up, so it cost the user real effort for nothing.
+#
+# `month` was removed for the same reason `season_index` was removed from
+# the old hook model: a linear trend fitted on months 3-5 and then
+# EXTRAPOLATED to 6-8 dragged every projection down by 0.418 outs.
+SHARED = ["rest", "n_starts", "home", "opp_runs"]
 
 
 def _feature_names(prop):
@@ -78,7 +97,18 @@ def _feature_names(prop):
     length bounds every counting stat in it, and the empirical correlation
     between outs and strikeouts is +0.513.
     """
-    return [f"recent_{prop}", f"career_{prop}", "recent_outs", "recent_pitches"] + SHARED
+    names = [f"recent_{prop}", f"career_{prop}", "recent_outs",
+             "recent_pitches"] + SHARED
+    # dedupe: for the outs prop, recent_outs would otherwise appear twice --
+    # once as the prop's own form term and once as the shared start-length
+    # term. Least squares tolerates the duplicate column, but a rank
+    # deficiency is not something to leave lying around on purpose.
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 class ProjectionModel:
@@ -89,18 +119,6 @@ class ProjectionModel:
     # ---------------------------------------------------------------- data
     def build(self, conn, since="2026-01-01"):
         """One row per start, features strictly pre-game."""
-        pen = defaultdict(list)
-        for r in conn.execute(
-                """SELECT p.team_id, g.game_date, p.innings_pitched, p.pitch_count
-                   FROM pitcher_game_stats p JOIN games g USING(game_id)
-                   WHERE p.is_starter = 0"""):
-            d = storage.local_game_date(r["game_date"])
-            if d:
-                pen[r["team_id"]].append(
-                    (d, storage.outs_from_innings_pitched(r["innings_pitched"]) or 0))
-        for t in pen:
-            pen[t].sort()
-
         team_runs = defaultdict(list)
         for r in conn.execute(
                 "SELECT team_id, game_date, runs_scored FROM team_game_stats"):
@@ -141,16 +159,11 @@ class ProjectionModel:
             h = hist[s["pid"]]
             if s["date"] >= since and len(h) >= 5:
                 d0 = datetime.fromisoformat(s["date"])
-                lo1 = str(d0 - timedelta(days=1))[:10]
-                lo3 = str(d0 - timedelta(days=3))[:10]
-                pl = pen.get(s["team"], [])
                 opp_r = [v for d, v in team_runs.get(s["opp"], []) if d < s["date"]]
                 row = {"date": s["date"], "gid": s["gid"], "pid": s["pid"],
                        "name": s["name"],
                        "rest": float(min((d0 - datetime.fromisoformat(h[-1]["date"])).days, 12)),
                        "n_starts": float(len(h)),
-                       "pen_outs_1d": float(sum(o for d, o in pl if lo1 <= d < s["date"])),
-                       "pen_outs_3d": float(sum(o for d, o in pl if lo3 <= d < s["date"])),
                        "home": s["home"], "month": float(int(s["date"][5:7])),
                        "opp_runs": statistics.mean(opp_r[-30:]) if opp_r else 4.5,
                        "recent_pitches": statistics.mean(x["pitches"] for x in h[-5:]),
@@ -192,16 +205,6 @@ class ProjectionModel:
             return None
         h.sort(key=lambda x: x["date"])
         d0 = datetime.fromisoformat(date)
-        lo1 = str(d0 - timedelta(days=1))[:10]
-        lo3 = str(d0 - timedelta(days=3))[:10]
-        pl = []
-        for r in conn.execute(
-                """SELECT g.game_date, p.innings_pitched
-                   FROM pitcher_game_stats p JOIN games g USING(game_id)
-                   WHERE p.team_id = ? AND p.is_starter = 0""", (team,)):
-            d = storage.local_game_date(r["game_date"])
-            if d and lo3 <= d < date:
-                pl.append((d, storage.outs_from_innings_pitched(r["innings_pitched"]) or 0))
         opp_r = []
         for r in conn.execute(
                 "SELECT game_date, runs_scored FROM team_game_stats WHERE team_id = ?",
@@ -213,8 +216,6 @@ class ProjectionModel:
         row = {"date": date, "pid": pid,
                "rest": float(min((d0 - datetime.fromisoformat(h[-1]["date"])).days, 12)),
                "n_starts": float(len(h)),
-               "pen_outs_1d": float(sum(o for d, o in pl if lo1 <= d < date)),
-               "pen_outs_3d": float(sum(o for d, o in pl if lo3 <= d < date)),
                "home": 1.0 if is_home else 0.0,
                "opp_runs": statistics.mean([v for _, v in opp_r[-30:]]) if opp_r else 4.5,
                "recent_pitches": statistics.mean(x["pitches"] for x in h[-5:]),
