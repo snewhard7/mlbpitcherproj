@@ -190,10 +190,7 @@ td:first-child{text-align:left;color:#c3cad9}
  <div><label>Side</label><select id=h><option value=1>Home</option>
    <option value=0>Away</option></select></div>
 </div>
-<div class=row>
- <div><label>Days rest</label><input id=r type=number value=5 min=2 max=12></div>
- <div><label>Pen outs (3d)</label><input id=b type=number value=9 min=0 max=40></div>
-</div>
+<label>Days rest</label><input id=r type=number value=5 min=2 max=12>
 <div id=out></div>
 <div class=foot>Fair odds, no vig &mdash; a posted &minus;110 against a fair
 &minus;110 is a 4.5% loser. Calibrated against realised outcomes, not against
@@ -212,8 +209,6 @@ function amer(p){if(p<=.001)return'+99999';if(p>=.999)return'-99999';
 function calc(){
  const pit=D.pitchers[+P.value], opp=O.value;
  const ctx={rest:+document.getElementById('r').value,
-   pen_outs_3d:+document.getElementById('b').value,
-   pen_outs_1d:+document.getElementById('b').value/3,
    home:+document.getElementById('h').value, opp_runs:D.teams[opp]};
  let html='';
  if(pit.x!==undefined){
@@ -256,7 +251,7 @@ function calc(){
  }
  document.getElementById('out').innerHTML=html;
 }
-[P,O,'h','r','b'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
+[P,O,'h','r'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
  el.addEventListener('change',calc);el.addEventListener('input',calc);});
 calc();
 </script>""".replace("__DATA__", data)
