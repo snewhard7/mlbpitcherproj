@@ -106,14 +106,24 @@ def main():
 
         stats = get("stats", **{"game_ids[]": gid})
         n_p = n_skip = 0
-        for s in stats:
-            pl, gm = s.get("player") or {}, s.get("game") or {}
-            ip = s.get("ip")
-            if ip is None:
-                continue
-            g_id = f"bdl_{gm.get('id')}" if gm.get("id") else None
-            p_id = f"bdl_{pl.get('id')}" if pl.get("id") else None
-            when = gm.get("date") or gdate.get(g_id)
+        for row in stats:
+            # FIELD NAMES CONFIRMED AGAINST THE WORKING CLIENT, not guessed.
+            # This endpoint serves batting and pitching rows together, so
+            # the pitching columns are PREFIXED p_ -- p_hits, p_runs, p_bb,
+            # p_k, p_hr -- while earned runs is plain `er` and hit-by-pitch
+            # is `pitching_hbp`. `game_id` is a FLAT field, not nested under
+            # a game object, and the starter flag is `games_started`.
+            #
+            # An earlier version guessed at all of these and skipped 488 of
+            # 488 rows. The guard below is what made that visible instead of
+            # silently writing nulls.
+            if row.get("ip") is None:
+                continue                      # a batting row, not pitching
+            pl = row.get("player") or {}
+            team = row.get("team") or {}
+            g_id = f"bdl_{row['game_id']}" if row.get("game_id") else None
+            p_id = f"bdl_{pl['id']}" if pl.get("id") else None
+            when = gdate.get(g_id)
             if not (g_id and p_id and when):
                 n_skip += 1
                 continue
@@ -124,11 +134,13 @@ def main():
                 "runs_allowed, earned_runs, walks_allowed, strikeouts, "
                 "home_runs_allowed, hit_by_pitch, is_starter, pitch_count) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (g_id, p_id,
-                 f"{pl.get('first_name','')} {pl.get('last_name','')}".strip(),
-                 f"bdl_{(s.get('team') or {}).get('id')}", when, ip,
-                 s.get("h"), s.get("r"), s.get("er"), s.get("bb"), s.get("k"),
-                 s.get("hr"), s.get("hb"), 1 if s.get("gs") else 0, s.get("pitch_count")))
+                (g_id, p_id, pl.get("full_name", ""),
+                 f"bdl_{team['id']}" if team.get("id") is not None else "",
+                 when, row.get("ip"), row.get("p_hits"), row.get("p_runs"),
+                 row.get("er"), row.get("p_bb"), row.get("p_k"),
+                 row.get("p_hr"), row.get("pitching_hbp"),
+                 1 if (row.get("games_started") or 0) > 0 else 0,
+                 row.get("pitch_count")))
         print(f"  {n_p} pitcher lines" +
               (f" ({n_skip} skipped, missing ids or date)" if n_skip else ""))
 
