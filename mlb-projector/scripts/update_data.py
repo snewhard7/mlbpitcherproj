@@ -82,7 +82,11 @@ def main():
     games = get("games", **{"dates[]": dates})
     print(f"  {len(games)} games")
     gid = []
+    n_bad = 0
     for g in games:
+        if not g.get("date") or not g.get("home_team") or not g.get("away_team"):
+            n_bad += 1
+            continue
         g_id = f"bdl_{g['id']}"
         gid.append(g['id'])
         conn.execute(
@@ -94,12 +98,24 @@ def main():
              g.get("away_team_score"), (g.get("status") or "").lower()))
 
     if gid:
+        # game_id -> date, from the games we just pulled. The stats endpoint
+        # does not reliably nest a game object on every row, and
+        # pitcher_game_stats.game_date is NOT NULL -- so the date is taken
+        # from the games response rather than trusted to be present here.
+        gdate = {f"bdl_{g['id']}": g.get("date") for g in games}
+
         stats = get("stats", **{"game_ids[]": gid})
-        n_p = 0
+        n_p = n_skip = 0
         for s in stats:
             pl, gm = s.get("player") or {}, s.get("game") or {}
             ip = s.get("ip")
             if ip is None:
+                continue
+            g_id = f"bdl_{gm.get('id')}" if gm.get("id") else None
+            p_id = f"bdl_{pl.get('id')}" if pl.get("id") else None
+            when = gm.get("date") or gdate.get(g_id)
+            if not (g_id and p_id and when):
+                n_skip += 1
                 continue
             n_p += 1
             conn.execute(
@@ -108,12 +124,13 @@ def main():
                 "runs_allowed, earned_runs, walks_allowed, strikeouts, "
                 "home_runs_allowed, hit_by_pitch, is_starter, pitch_count) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (f"bdl_{gm.get('id')}", f"bdl_{pl.get('id')}",
+                (g_id, p_id,
                  f"{pl.get('first_name','')} {pl.get('last_name','')}".strip(),
-                 f"bdl_{(s.get('team') or {}).get('id')}", gm.get("date"), ip,
+                 f"bdl_{(s.get('team') or {}).get('id')}", when, ip,
                  s.get("h"), s.get("r"), s.get("er"), s.get("bb"), s.get("k"),
                  s.get("hr"), s.get("hb"), 1 if s.get("gs") else 0, s.get("pitch_count")))
-        print(f"  {n_p} pitcher lines")
+        print(f"  {n_p} pitcher lines" +
+              (f" ({n_skip} skipped, missing ids or date)" if n_skip else ""))
 
     conn.commit()
     latest = conn.execute(
