@@ -178,6 +178,8 @@ td:first-child{text-align:left;color:#c3cad9}
 .ctx{background:#1b1e26;border-radius:11px;margin-top:13px;padding:11px 13px;
  font-size:13px;color:#9aa3b8}
 .ctx b{color:#e8eaf0;font-weight:600}
+.rest{color:#8a91a3;font-size:12px;margin-top:5px}
+.rest b{color:#6ee7a8}
 .luck{float:right;font-weight:600}
 .lucky{color:#ffb37f}   /* results flattering -- expect regression */
 .unlucky{color:#7fb8ff} /* results harsh -- expect improvement */
@@ -190,7 +192,8 @@ td:first-child{text-align:left;color:#c3cad9}
  <div><label>Side</label><select id=h><option value=1>Home</option>
    <option value=0>Away</option></select></div>
 </div>
-<label>Days rest</label><input id=r type=number value=5 min=2 max=12>
+<label>Game date</label><input id=g type=date>
+<div class=rest id=restnote></div>
 <div id=out></div>
 <div class=foot>Fair odds, no vig &mdash; a posted &minus;110 against a fair
 &minus;110 is a 4.5% loser. Calibrated against realised outcomes, not against
@@ -208,7 +211,22 @@ function amer(p){if(p<=.001)return'+99999';if(p>=.999)return'-99999';
  return p>.5?'-'+Math.round(100*p/(1-p)):'+'+Math.round(100*(1-p)/p);}
 function calc(){
  const pit=D.pitchers[+P.value], opp=O.value;
- const ctx={rest:+document.getElementById('r').value,
+ // REST IS DERIVED, not typed. The file already carries each pitcher's
+ // last start date, so subtracting is the machine's job. Capped at 12 to
+ // match how the model was fitted -- beyond that the feature was clipped
+ // in training and extrapolating it would be inventing a value the
+ // regression never saw.
+ let rest=5, note='';
+ const gd=document.getElementById('g').value;
+ if(gd && pit.d){
+  const ms=(new Date(gd)-new Date(pit.d))/86400000;
+  if(ms>0){ rest=Math.min(Math.round(ms),12);
+    note='last start '+pit.d+' \u00b7 <b>'+Math.round(ms)+' days rest</b>'+
+      (ms>12?' (capped at 12 for the model)':'');
+  } else { note='game date is not after the last start \u2014 using 5 days'; }
+ } else { note='pick a game date to derive rest \u00b7 assuming 5 days'; }
+ document.getElementById('restnote').innerHTML=note;
+ const ctx={rest:rest,
    home:+document.getElementById('h').value, opp_runs:D.teams[opp]};
  let html='';
  if(pit.x!==undefined){
@@ -251,8 +269,12 @@ function calc(){
  }
  document.getElementById('out').innerHTML=html;
 }
-[P,O,'h','r'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
+[P,O,'h','g'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
  el.addEventListener('change',calc);el.addEventListener('input',calc);});
+(function(){const d=new Date();
+ document.getElementById('g').value=
+  d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+
+  String(d.getDate()).padStart(2,'0');})();
 calc();
 </script>""".replace("__DATA__", data)
 
