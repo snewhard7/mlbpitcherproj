@@ -1,0 +1,266 @@
+"""
+Export a SELF-CONTAINED projector you can use on a phone, offline.
+
+THE PROBLEM THIS SOLVES. tests/project_slate.py needs a command line and
+the 1.3 GB database, so it only runs at a computer. A scheduled task plus
+cloud sync would work but still depends on that machine being awake.
+
+THE APPROACH. The model is a linear regression per prop plus an empirical
+outcome distribution -- small enough to EMBED. This writes one HTML file
+containing the fitted coefficients, every starter's current form, and each
+team's scoring rate. You pick a pitcher and opponent on the phone and the
+ladder is computed in the browser. No server, no network, no command.
+
+IT ALSO REMOVES THE DEPENDENCE ON PROBABLE PITCHERS, which the slate
+version needs and which are often not stored until shortly before games.
+You are reading the matchup off the book anyway.
+
+WHAT GOES STALE, AND HOW FAST. A pitcher's recent form only changes when
+he starts, so roughly every five days. Regenerating weekly is ample;
+regenerate after any data pull if you want it exact. The file states the
+date it was built from so a stale copy is obvious.
+
+WHY THE DISTRIBUTION IS SHIPPED AS A HISTOGRAM. Outs pile up at inning
+boundaries -- 15 outs is five innings and 18 is six, and roughly a fifth
+of starts stop at each. A line at 15.5 sits IMMEDIATELY ABOVE the first
+pile, so the over must clear a whole further inning past the most common
+stopping point. No smooth curve reproduces that, so the empirical
+distribution travels with the model rather than being approximated in the
+browser.
+
+Run:  python -m tests.export_phone_projector
+"""
+import json
+import sqlite3
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+from shim import storage
+from projection import ProjectionModel, PROPS, PROP_LINES, _feature_names
+
+DB = Path(__file__).parent.parent / "data.db"
+LABEL = {"outs": "Outs", "strikeouts": "Ks", "hits": "Hits",
+         "walks": "Walks", "runs": "Runs"}
+
+
+def main():
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    print("fitting...", flush=True)
+    model = ProjectionModel()
+    rows = model.build(conn, since="2026-01-01")
+    model.fit(rows).fit_conditional(rows)
+    asof = max(r["date"] for r in rows)
+    print(f"  {len(rows)} starts, data through {asof}", flush=True)
+
+    # --- CONTEXT ONLY: xwOBA against actual wOBA -------------------------
+    #
+    # This does NOT enter the projection, and that is a deliberate choice
+    # backed by a test. Proper xwOBA -- expected value on contact, actual
+    # value on strikeouts and walks -- IS more predictive than past
+    # results: across 353 pitchers with 16+ games, first-half xwOBA
+    # forecast second-half wOBA at r=+0.459 against +0.407 for first-half
+    # wOBA. The classic claim holds.
+    #
+    # But adding it to the regression moved every prop by less than 0.35%,
+    # several of them negative. Two reasons. These props are counting
+    # stats dominated by WORKLOAD -- outs correlate +0.28 with batters
+    # faced and only +0.12 with per-PA rate -- so xwOBA sharpens a term
+    # that is not the binding one. And its advantage over plain wOBA is
+    # largest at SMALL samples, while a five-start average has mostly
+    # caught up already.
+    #
+    # Where it does matter is exactly where results have not caught up to
+    # mechanism: a pitcher back from injury, a mid-season stuff change, a
+    # rookie with three starts. That is a judgement call rather than a
+    # regression term, so it is surfaced as context and left to the reader.
+    xwoba = {r["player_id"]: (r["xwoba"], r["woba"])
+             for r in conn.execute("SELECT * FROM pitcher_xwoba")}
+
+    # --- per pitcher current form, from his most recent starts -----------
+    hist = defaultdict(list)
+    for r in conn.execute(
+            """SELECT p.player_id, p.player_name, p.innings_pitched, p.pitch_count,
+                      p.strikeouts, p.hits_allowed, p.walks_allowed,
+                      p.runs_allowed, g.game_date
+               FROM pitcher_game_stats p JOIN games g USING(game_id)
+               WHERE p.is_starter = 1"""):
+        d = storage.local_game_date(r["game_date"])
+        o = storage.outs_from_innings_pitched(r["innings_pitched"])
+        if d and o is not None:
+            hist[(r["player_id"], r["player_name"])].append({
+                "date": d, "outs": float(o), "pitches": float(r["pitch_count"] or 0),
+                "strikeouts": float(r["strikeouts"] or 0),
+                "hits": float(r["hits_allowed"] or 0),
+                "walks": float(r["walks_allowed"] or 0),
+                "runs": float(r["runs_allowed"] or 0)})
+
+    pitchers = []
+    for (pid, name), h in hist.items():
+        h.sort(key=lambda x: x["date"])
+        # only pitchers who have started recently enough to still be starting
+        if len(h) < 5 or h[-1]["date"] < "2026-06-15":
+            continue
+        f = {"recent_pitches": statistics.mean(x["pitches"] for x in h[-5:]),
+             "recent_outs": statistics.mean(x["outs"] for x in h[-5:]),
+             "n_starts": float(len(h))}
+        for p in PROPS:
+            f[f"recent_{p}"] = statistics.mean(x[p] for x in h[-5:])
+            f[f"career_{p}"] = statistics.mean(x[p] for x in h)
+        rec = {"n": name, "d": h[-1]["date"],
+               "f": {k: round(v, 4) for k, v in f.items()}}
+        if pid in xwoba:
+            rec["x"], rec["w"] = xwoba[pid]
+        pitchers.append(rec)
+    pitchers.sort(key=lambda x: x["n"])
+    print(f"  {len(pitchers)} active starters", flush=True)
+
+    teams = {}
+    for r in conn.execute("SELECT team_id, abbreviation FROM teams"):
+        runs = [x["runs_scored"] for x in conn.execute(
+            "SELECT game_date, runs_scored FROM team_game_stats WHERE team_id=? "
+            "ORDER BY game_date DESC LIMIT 30", (r["team_id"],))
+            if x["runs_scored"] is not None]
+        teams[r["abbreviation"]] = round(statistics.mean(runs), 3) if runs else 4.5
+
+    # --- model payload ---------------------------------------------------
+    fits = {}
+    for p in PROPS:
+        F, mu, sd, beta = model.fits[p]
+        # ship the conditional distribution as (bin centre, outcome counts)
+        bins = [{"c": round(c, 3),
+                 "h": {str(int(k)): int(v) for k, v in
+                       zip(*np.unique(np.round(s), return_counts=True))}}
+                for c, s in model.cond[p]]
+        fits[p] = {"F": F, "mu": [round(x, 6) for x in mu],
+                   "sd": [round(x, 6) for x in sd],
+                   "b": [round(x, 6) for x in beta],
+                   "bins": bins, "lines": PROP_LINES[p], "label": LABEL[p]}
+
+    payload = {"asof": asof, "fits": fits, "pitchers": pitchers, "teams": teams}
+    out = Path(__file__).parent.parent / "index.html"
+    out.write_text(render(payload), encoding="utf-8")
+    kb = out.stat().st_size / 1024
+    print(f"\nwrote {out.resolve()}  ({kb:.0f} KB)")
+    return 0
+
+
+def render(payload):
+    data = json.dumps(payload, separators=(",", ":"))
+    return """<!doctype html><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'>
+<title>Prop Projector</title><style>
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:#12141a;color:#e8eaf0;
+ font:16px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+h1{font-size:18px;margin:0 0 2px}
+.sub{color:#8a91a3;font-size:12px;margin-bottom:14px}
+label{display:block;font-size:11px;color:#7a8196;text-transform:uppercase;
+ letter-spacing:.4px;margin:10px 0 3px}
+select,input{width:100%;padding:11px;font-size:16px;background:#1b1e26;
+ color:#e8eaf0;border:1px solid #2b3040;border-radius:9px}
+.row{display:flex;gap:9px}.row>div{flex:1}
+.prop{background:#1b1e26;border-radius:11px;margin-top:13px;padding:12px 13px}
+.plabel{font-size:13px;color:#9aa3b8;margin-bottom:6px}
+.proj{color:#6ee7a8;font-weight:700;font-size:17px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{color:#7a8196;font-weight:500;font-size:10px;text-align:right;padding:3px 4px;
+ text-transform:uppercase;letter-spacing:.4px}
+th:first-child{text-align:left}
+td{padding:5px 4px;text-align:right;border-top:1px solid #262b38}
+td:first-child{text-align:left;color:#c3cad9}
+.o{color:#7fb8ff}.u{color:#ffb37f}.near{background:#222a38}
+.foot{color:#6b7285;font-size:11px;margin-top:18px;line-height:1.6}
+.ctx{background:#1b1e26;border-radius:11px;margin-top:13px;padding:11px 13px;
+ font-size:13px;color:#9aa3b8}
+.ctx b{color:#e8eaf0;font-weight:600}
+.luck{float:right;font-weight:600}
+.lucky{color:#ffb37f}   /* results flattering -- expect regression */
+.unlucky{color:#7fb8ff} /* results harsh -- expect improvement */
+</style>
+<h1>Prop Projector</h1>
+<div class=sub id=asof></div>
+<label>Pitcher</label><select id=p></select>
+<div class=row>
+ <div><label>Opponent</label><select id=o></select></div>
+ <div><label>Side</label><select id=h><option value=1>Home</option>
+   <option value=0>Away</option></select></div>
+</div>
+<div class=row>
+ <div><label>Days rest</label><input id=r type=number value=5 min=2 max=12></div>
+ <div><label>Pen outs (3d)</label><input id=b type=number value=9 min=0 max=40></div>
+</div>
+<div id=out></div>
+<div class=foot>Fair odds, no vig &mdash; a posted &minus;110 against a fair
+&minus;110 is a 4.5% loser. Calibrated against realised outcomes, not against
+the market: a gap is a genuine disagreement, not proof the price is wrong.
+No prop has been shown to beat a closing line. Walks carries the least
+signal; treat its gaps with the most suspicion.</div>
+<script>
+const D=__DATA__;
+document.getElementById('asof').textContent='data through '+D.asof+
+  ' \\u00b7 '+D.pitchers.length+' starters';
+const P=document.getElementById('p'),O=document.getElementById('o');
+D.pitchers.forEach((x,i)=>P.add(new Option(x.n+'  ('+x.d+')',i)));
+Object.keys(D.teams).sort().forEach(t=>O.add(new Option(t,t)));
+function amer(p){if(p<=.001)return'+99999';if(p>=.999)return'-99999';
+ return p>.5?'-'+Math.round(100*p/(1-p)):'+'+Math.round(100*(1-p)/p);}
+function calc(){
+ const pit=D.pitchers[+P.value], opp=O.value;
+ const ctx={rest:+document.getElementById('r').value,
+   pen_outs_3d:+document.getElementById('b').value,
+   pen_outs_1d:+document.getElementById('b').value/3,
+   home:+document.getElementById('h').value, opp_runs:D.teams[opp]};
+ let html='';
+ if(pit.x!==undefined){
+  const d=pit.w-pit.x;
+  // SIGN CARE: for a PITCHER, a HIGHER wOBA allowed is worse. Actual
+  // above expected means he was hit harder than his contact quality
+  // warranted -- unlucky, and an argument his results should improve.
+  const tag=d>0.02?'<span class="luck unlucky">unlucky &middot; hit harder than contact quality</span>'
+      :(d<-0.02?'<span class="luck lucky">lucky &middot; better results than contact quality</span>':'');
+  html+='<div class=ctx>last 5 starts &nbsp; xwOBA <b>'+pit.x.toFixed(3)+
+    '</b> &nbsp; actual wOBA <b>'+pit.w.toFixed(3)+'</b>'+tag+'</div>';
+ }
+ for(const key in D.fits){
+  const f=D.fits[key];
+  let z=f.b[0];
+  f.F.forEach((name,i)=>{
+   const v=(name in pit.f)?pit.f[name]:ctx[name];
+   z+=f.b[i+1]*((v-f.mu[i])/f.sd[i]);
+  });
+  // nearest conditional bin, shifted to this projection
+  let best=f.bins[0];
+  f.bins.forEach(b=>{if(Math.abs(b.c-z)<Math.abs(best.c-z))best=b;});
+  const shift=z-best.c;
+  let tot=0;const pts=[];
+  for(const k in best.h){const c=best.h[k];tot+=c;pts.push([+k+shift,c]);}
+  const near=f.lines.map(l=>Math.abs(l-z)).reduce((a,b,i,arr)=>arr[a]<b?a:i,0);
+  const lo=Math.max(0,near-3),hi=Math.min(f.lines.length,near+4);
+  let rows='';
+  f.lines.slice(lo,hi).forEach(l=>{
+   let over=0;pts.forEach(([v,c])=>{if(Math.round(v)>l)over+=c;});
+   const po=over/tot;
+   rows+='<tr'+(Math.abs(l-z)<1?' class=near':'')+'><td>'+l+'</td>'+
+    '<td class=o>'+Math.round(po*100)+'%</td><td class=o>'+amer(po)+'</td>'+
+    '<td class=u>'+Math.round((1-po)*100)+'%</td><td class=u>'+amer(1-po)+'</td></tr>';
+  });
+  html+='<div class=prop><div class=plabel>'+f.label+
+   ' <span class=proj>'+z.toFixed(2)+'</span></div><table>'+
+   '<tr><th>Line</th><th>Over</th><th>Fair</th><th>Under</th><th>Fair</th></tr>'+
+   rows+'</table></div>';
+ }
+ document.getElementById('out').innerHTML=html;
+}
+[P,O,'h','r','b'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
+ el.addEventListener('change',calc);el.addEventListener('input',calc);});
+calc();
+</script>""".replace("__DATA__", data)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
