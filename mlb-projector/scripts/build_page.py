@@ -194,6 +194,10 @@ td:first-child{text-align:left;color:#c3cad9}
 </div>
 <label>Game date</label><input id=g type=date>
 <div class=rest id=restnote></div>
+<label style="margin-top:12px">Context</label>
+<select id=po><option value=0>Regular season</option>
+ <option value=1>Playoffs</option></select>
+<div class=rest id=ponote></div>
 <div id=out></div>
 <div class=foot>Fair odds, no vig &mdash; a posted &minus;110 against a fair
 &minus;110 is a 4.5% loser. Calibrated against realised outcomes, not against
@@ -228,6 +232,13 @@ function calc(){
  document.getElementById('restnote').innerHTML=note;
  const ctx={rest:rest,
    home:+document.getElementById('h').value, opp_runs:D.teams[opp]};
+ // the strikeout tier is keyed off the pitcher's projected OUTS, not his
+ // projected strikeouts -- the tiers were measured on start length.
+ let base_outs=0;
+ {const f=D.fits['outs']; let z=f.b[0];
+  f.F.forEach((n,i)=>{const v=(n in pit.f)?pit.f[n]:ctx[n];
+   z+=f.b[i+1]*((v-f.mu[i])/f.sd[i]);});
+  base_outs=z;}
  let html='';
  if(pit.x!==undefined){
   const d=pit.w-pit.x;
@@ -246,6 +257,29 @@ function calc(){
    const v=(name in pit.f)?pit.f[name]:ctx[name];
    z+=f.b[i+1]*((v-f.mu[i])/f.sd[i]);
   });
+  // PLAYOFF ADJUSTMENT -- measured by hand, not fitted into the model.
+  //
+  // Within pitcher, same season, 383 postseason starts: outs run 2.85
+  // shorter overall, at -11.63 sigma. But the effect is NOT uniform, and
+  // the difference between mid-tier starters (-3.69) and aces (-1.91) is
+  // 3.6 sigma. Applying one blanket number would be nearly a full out too
+  // aggressive on exactly the arms most likely to be worth betting, so
+  // the tiers are used even though they barely beat flat on RMSE --
+  // RMSE is dominated by per-start variance and cannot see a systematic
+  // subgroup error that matters enormously for pricing one pitcher.
+  //
+  // HITS take a flat -0.50 (5.12 sigma). WALKS (-1.35 sigma) and RUNS
+  // (-0.03) never showed a real effect and are left alone.
+  //
+  // A fitted line scored slightly better on hits, walks and runs -- but
+  // its slopes were 0.348, 0.474 and -0.075, meaning it was largely
+  // DISCARDING the pitcher and substituting a constant. That is a strong
+  // claim from 383 starts for a 3-5% RMSE gain, so it is not used.
+  if(document.getElementById('po').value==='1'){
+   if(key==='outs')       z += (z<15.5? -2.26 : (z<17.5? -3.69 : -1.91));
+   else if(key==='strikeouts') z += (base_outs<15.5? -1.09 : (base_outs<17.5? -1.34 : -0.74));
+   else if(key==='hits')  z += -0.50;
+  }
   // nearest conditional bin, shifted to this projection
   let best=f.bins[0];
   f.bins.forEach(b=>{if(Math.abs(b.c-z)<Math.abs(best.c-z))best=b;});
@@ -269,12 +303,18 @@ function calc(){
  }
  document.getElementById('out').innerHTML=html;
 }
-[P,O,'h','g'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
+[P,O,'h','g','po'].forEach(e=>{const el=typeof e==='string'?document.getElementById(e):e;
  el.addEventListener('change',calc);el.addEventListener('input',calc);});
 (function(){const d=new Date();
  document.getElementById('g').value=
   d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+
   String(d.getDate()).padStart(2,'0');})();
+ document.getElementById('ponote').innerHTML =
+   document.getElementById('po').value==='1'
+   ? 'outs and strikeouts adjusted by tier, hits by \u22120.50 \u00b7 '+
+     'walks and runs unchanged \u00b7 <b>treat hits/walks/runs gaps with '+
+     'extra suspicion in October</b>'
+   : '';
 calc();
 </script>""".replace("__DATA__", data)
 
